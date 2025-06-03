@@ -1263,12 +1263,16 @@ class Simulation:
         """Handle packet transmissions and detect collisions"""
         # First, collect transmissions by subframe
         tx_by_subframe = defaultdict(list)
-
+        resource_usage = defaultdict(list)  # (subframe, rb) -> [vehicle_ids]
         for sender, packet, resource in transmissions:
             # Convert to subframe index for resource pool
             sf_idx = (resource.subframe.frame_no * 10 + resource.subframe.subframe_no - 1) % self.resource_pool.num_slots
             tx_by_subframe[sf_idx].append((sender, packet, resource))
-
+            for rb in range(resource.rb_start, resource.rb_start + resource.rb_len):
+                resource_usage[(sf_idx, rb)].append(sender.id)
+            
+            self.ntx_packets += 1  # Count transmitted packets
+            self.ntx_total += 1  # Count unique packets
             # Increment transmission count
             self.transmission_count += 1
 
