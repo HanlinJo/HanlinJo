@@ -12,16 +12,15 @@ def process_packets():
         # Check for collisions in resource pool
         for existing_block in resource_pool:
             if has_overlap(resource_block, existing_block):
-                collision_count += 1
+                collision_count += 2  # Increment by 2 for collision
                 return
         
         # No collision, add to resource pool
         resource_pool.append(resource_block)
-        total_packets += 1
+        total_packets += 1  # Increment by 1 for successful transmission
 
     def has_overlap(block1, block2):
         # Check if two resource blocks overlap
-        # This is a simplified example - implement actual overlap logic based on your requirements
         return any(rb in block2 for rb in block1)
 
     # Main processing loop
