@@ -13,11 +13,12 @@ logger = logging.getLogger('V2X-MODE4-Simplified')
 class Packet:
     """Represents a V2X packet for transmission"""
     
-    def __init__(self, sender_id, timestamp, position, size=190):
+    def __init__(self, sender_id, timestamp, position, size=190, is_attack=False):
         self.sender_id = sender_id
         self.timestamp = timestamp
         self.position = position
         self.size = size
+        self.is_attack = is_attack  # Flag to identify attack packets
 
 class SensingData:
     """Represents sensing data from previous transmissions"""
@@ -189,6 +190,173 @@ class Vehicle:
         distance = np.linalg.norm(self.position - sender_position)
         return distance <= self.sim.communication_range
 
+class Attacker:
+    """Represents an attacker with malicious V2X capability"""
+    
+    def __init__(self, attacker_id, initial_position, initial_velocity, sim):
+        self.id = attacker_id
+        self.position = initial_position
+        self.velocity = initial_velocity
+        self.sim = sim
+        
+        # Attacker-specific parameters
+        self.next_transmission_time = 0
+        self.transmission_cycle = 20  # 20ms transmission cycle (more aggressive than normal vehicles)
+        
+        # Resource pool information storage
+        self.resource_pool_info = {}
+        self.observed_transmissions = []
+        
+        # Attack statistics
+        self.attack_packets_sent = 0
+        self.attack_success_count = 0  # Number of successful attacks (causing collisions)
+        self.collisions_caused = 0
+        
+        # Movement and sensing
+        self.sensing_data = []
+    
+    def move(self, delta_time):
+        """Update attacker position based on velocity and time delta"""
+        self.position = self.position + self.velocity * delta_time
+    
+    def collect_resource_pool_info(self, current_time):
+        """Collect information about the current resource pool usage"""
+        # Store current time and resource pool state
+        self.resource_pool_info[current_time] = {
+            'num_subchannels': self.sim.resource_pool.num_subchannels,
+            'num_slots': self.sim.resource_pool.num_slots,
+            'subchannel_size': self.sim.resource_pool.subchannel_size,
+            'total_rbs': self.sim.resource_pool.total_rbs,
+            'active_vehicles': len(self.sim.vehicles),
+            'observed_transmissions': len(self.observed_transmissions)
+        }
+        
+        logger.debug(f"Attacker {self.id} collected resource pool info at time {current_time}ms")
+    
+    def select_random_resource(self, current_time):
+        """Select a random resource for attack transmission"""
+        # Create a simple selection window (similar to vehicles but shorter)
+        t1_time = current_time + 1  # Very short T1 for immediate attack
+        t2_time = current_time + 20  # Short T2 for quick resource selection
+        
+        # Convert to subframe information
+        t1_frame = math.floor(t1_time / 10) % 1024
+        t1_subframe = math.floor(t1_time % 10) + 1
+        
+        t2_frame = math.floor(t2_time / 10) % 1024
+        t2_subframe = math.floor(t2_time % 10) + 1
+        
+        start_subframe = SubframeInfo(t1_frame, t1_subframe)
+        end_subframe = SubframeInfo(t2_frame, t2_subframe)
+        
+        # Create selection window
+        selection_window = []
+        current_frame = start_subframe.frame_no
+        current_subframe = start_subframe.subframe_no
+        
+        while True:
+            current_sf = SubframeInfo(current_frame, current_subframe)
+            
+            # For each subframe, consider all subchannels
+            for subchannel in range(self.sim.resource_pool.num_subchannels):
+                selection_window.append(ResourceInfo(current_sf, subchannel))
+                
+            if current_sf.frame_no > end_subframe.frame_no or (current_sf.frame_no == end_subframe.frame_no and current_sf.subframe_no > end_subframe.subframe_no):
+                break
+                
+            # Move to next subframe
+            current_subframe += 1
+            if current_subframe > 10:
+                current_subframe = 1
+                current_frame += 1
+                if current_frame > 1024:
+                    current_frame = 1
+        
+        # Randomly select a resource
+        if selection_window:
+            selected_resource = random.choice(selection_window)
+            selected_resource.rb_start = selected_resource.subchannel * self.sim.resource_pool.subchannel_size
+            selected_resource.rb_len = self.sim.resource_pool.subchannel_size
+            return selected_resource
+        
+        return None
+    
+    def send_attack_packet(self, current_time):
+        """Send an attack packet using random resource selection"""
+        if current_time < self.next_transmission_time:
+            return None
+        
+        # Collect resource pool information before attacking
+        self.collect_resource_pool_info(current_time)
+        
+        # Select a random resource for the attack
+        attack_resource = self.select_random_resource(current_time)
+        
+        if attack_resource is None:
+            logger.warning(f"Attacker {self.id} could not select a resource for attack")
+            return None
+        
+        # Create attack packet
+        attack_packet = Packet(self.id, current_time, self.position, is_attack=True)
+        
+        # Schedule next attack transmission
+        self.next_transmission_time = current_time + self.transmission_cycle
+        
+        # Update attack statistics
+        self.attack_packets_sent += 1
+        
+        logger.debug(f"Attacker {self.id} sending attack packet at time {current_time}ms " +
+                     f"using subchannel {attack_resource.subchannel}")
+        
+        return (attack_packet, attack_resource)
+    
+    def observe_transmission(self, sender, packet, resource):
+        """Observe and record legitimate vehicle transmissions"""
+        observation = {
+            'time': packet.timestamp,
+            'sender_id': sender.id,
+            'position': sender.position.copy(),
+            'resource': {
+                'subframe': resource.subframe,
+                'subchannel': resource.subchannel,
+                'rb_start': resource.rb_start,
+                'rb_len': resource.rb_len
+            }
+        }
+        self.observed_transmissions.append(observation)
+        
+        # Keep only recent observations (last 1000ms)
+        current_time = packet.timestamp
+        self.observed_transmissions = [
+            obs for obs in self.observed_transmissions 
+            if current_time - obs['time'] <= 1000
+        ]
+    
+    def record_attack_success(self, collision_occurred):
+        """Record whether an attack was successful (caused collision)"""
+        if collision_occurred:
+            self.attack_success_count += 1
+            self.collisions_caused += 1
+            logger.debug(f"Attacker {self.id} successfully caused a collision")
+    
+    def should_receive_packet(self, sender_position):
+        """Determine if this attacker should receive a packet from sender"""
+        distance = np.linalg.norm(self.position - sender_position)
+        return distance <= self.sim.communication_range
+    
+    def receive_packet(self, packet, resource, collision_occurred):
+        """Process a received packet (for sensing purposes)"""
+        # Store sensing information
+        subframe_info = resource.subframe
+        rb_start = resource.rb_start
+        rb_len = resource.rb_len
+        
+        # Add to sensing window
+        sensing_data = SensingData(subframe_info, rb_start, rb_len, packet.sender_id)
+        self.sensing_data.append(sensing_data)
+        
+        return not collision_occurred
+
 class ResourcePool:
     """Manages the sidelink resource pool for V2X communication"""
     
@@ -201,17 +369,20 @@ class ResourcePool:
 class Simulation:
     """Manages the overall V2X simulation with simplified collision detection"""
     
-    def __init__(self, num_vehicles=20, duration=50000, communication_range=320.0):
+    def __init__(self, num_vehicles=20, num_attackers=1, duration=50000, communication_range=320.0):
         self.num_vehicles = num_vehicles
+        self.num_attackers = num_attackers
         self.duration = duration  # Simulation duration in ms
         self.communication_range = communication_range  # Communication range in meters
         
         # Initialize resource pool
         self.resource_pool = ResourcePool(num_subchannels=5, num_slots=100, subchannel_size=10)
         
-        # Initialize vehicles
+        # Initialize vehicles and attackers
         self.vehicles = []
+        self.attackers = []
         self._initialize_vehicles()
+        self._initialize_attackers()
         
         # Simulation time variables
         self.current_time = 0
@@ -222,9 +393,15 @@ class Simulation:
         self.total_expected_packets = 0
         self.total_received_packets = 0
         
+        # Attack-specific statistics
+        self.attack_transmission_count = 0
+        self.attack_collision_count = 0
+        self.total_attack_success = 0
+        
         # Time-based statistics
         self.collision_stats = defaultdict(int)
         self.transmission_stats = defaultdict(int)
+        self.attack_stats = defaultdict(int)
         self.prr_stats = defaultdict(float)
     
     def _initialize_vehicles(self):
@@ -251,9 +428,33 @@ class Simulation:
             vehicle = Vehicle(i, position, velocity, self)
             self.vehicles.append(vehicle)
     
+    def _initialize_attackers(self):
+        """Initialize attackers with random positions and velocities"""
+        lane1_y = 5.0
+        lane2_y = 10.0
+        highway_length = 1000.0
+        
+        for i in range(self.num_attackers):
+            # Attacker ID starts after vehicle IDs
+            attacker_id = self.num_vehicles + i
+            
+            # Random position and lane
+            lane_y = lane1_y if i % 2 == 0 else lane2_y
+            pos_x = random.uniform(0, highway_length)
+            position = np.array([pos_x, lane_y])
+            
+            # Set velocity based on lane
+            velocity = np.array([10.0 if lane_y == lane1_y else -10.0, 0.0])
+            
+            # Create the attacker
+            attacker = Attacker(attacker_id, position, velocity, self)
+            self.attackers.append(attacker)
+            
+            logger.info(f"Initialized Attacker {attacker_id} at position {position}")
+    
     def run(self):
         """Run the simulation"""
-        logger.info(f"Starting simplified V2X MODE4 simulation with {self.num_vehicles} vehicles")
+        logger.info(f"Starting simplified V2X MODE4 simulation with {self.num_vehicles} vehicles and {self.num_attackers} attackers")
         
         time_step = 1  # 1ms time step
         
@@ -263,6 +464,10 @@ class Simulation:
             for vehicle in self.vehicles:
                 vehicle.move(time_step / 1000.0)  # Convert to seconds
             
+            # Update attacker positions
+            for attacker in self.attackers:
+                attacker.move(time_step / 1000.0)
+            
             # Process transmissions
             self._process_transmissions()
             
@@ -270,7 +475,8 @@ class Simulation:
             if self.current_time % 1000 == 0:
                 self._record_statistics()
                 logger.info(f"Time: {self.current_time}ms, Transmissions: {self.transmission_count}, " +
-                          f"Collisions: {self.collision_count}")
+                          f"Collisions: {self.collision_count}, Attack Transmissions: {self.attack_transmission_count}, " +
+                          f"Attack Success: {self.total_attack_success}")
             
             # Increment time
             self.current_time += time_step
@@ -282,7 +488,9 @@ class Simulation:
         """Process packet transmissions for the current time step"""
         # Collect all transmissions for this time step
         transmissions = []
+        attack_transmissions = []
         
+        # Process vehicle transmissions
         for vehicle in self.vehicles:
             tx_result = vehicle.send_packet(self.current_time)
             vehicle.resel_counter -= 1  # Decrement reselection counter
@@ -291,10 +499,25 @@ class Simulation:
             if tx_result:
                 packet, resource = tx_result
                 transmissions.append((vehicle, packet, resource))
+        
+        # Process attacker transmissions
+        for attacker in self.attackers:
+            attack_result = attacker.send_attack_packet(self.current_time)
+            if attack_result:
+                packet, resource = attack_result
+                attack_transmissions.append((attacker, packet, resource))
+                self.attack_transmission_count += 1
+                
+                # Let attacker observe legitimate transmissions
+                for vehicle, v_packet, v_resource in transmissions:
+                    attacker.observe_transmission(vehicle, v_packet, v_resource)
+
+        # Combine all transmissions for collision detection
+        all_transmissions = transmissions + attack_transmissions
 
         # Process transmissions and detect collisions
-        if transmissions:
-            self._handle_transmissions(transmissions)
+        if all_transmissions:
+            self._handle_transmissions(all_transmissions)
     
     def _handle_transmissions(self, transmissions):
         """Simplified collision detection based purely on resource conflicts"""
@@ -321,15 +544,27 @@ class Simulation:
             
             # Detect collisions: any resource block used by multiple vehicles
             collided_transmissions = set()
+            attack_caused_collisions = set()
             
             for rb, users in rb_usage.items():
                 if len(users) > 1:  # Collision detected on this resource block
                     logger.debug(f"Collision detected on RB {rb} in subframe {sf_idx}: " +
                                f"{[u[0].id for u in users]}")
                     
-                    # Mark all transmissions using this RB as collided
+                    # Check if any attacker is involved in this collision
+                    attacker_involved = False
                     for sender, packet, resource in users:
+                        if isinstance(sender, Attacker):
+                            attacker_involved = True
+                            attack_caused_collisions.add(sender.id)
                         collided_transmissions.add(sender.id)
+                    
+                    # If attacker caused collision, record attack success
+                    if attacker_involved:
+                        for sender, packet, resource in users:
+                            if isinstance(sender, Attacker):
+                                sender.record_attack_success(True)
+                                self.total_attack_success += 1
             
             # Update collision statistics
             collision_count_this_subframe = len(collided_transmissions)
@@ -337,10 +572,20 @@ class Simulation:
             
             # Update per-vehicle collision counts
             for sender_id in collided_transmissions:
-                self.vehicles[sender_id].collisions += 1
+                # Find the sender (could be vehicle or attacker)
+                for vehicle in self.vehicles:
+                    if vehicle.id == sender_id:
+                        vehicle.collisions += 1
+                        break
+                for attacker in self.attackers:
+                    if attacker.id == sender_id:
+                        attacker.collisions_caused += 1
+                        break
             
-            # Process packet reception for all vehicles
-            for receiver in self.vehicles:
+            # Process packet reception for all vehicles and attackers
+            all_receivers = self.vehicles + self.attackers
+            
+            for receiver in all_receivers:
                 for sender, packet, resource in sf_transmissions:
                     if sender.id != receiver.id:  # Don't receive own packet
                         # Check if receiver is within communication range
@@ -355,18 +600,20 @@ class Simulation:
                             
                             if success:
                                 self.total_received_packets += 1
-                                sender.successful_transmissions += 1
+                                if hasattr(sender, 'successful_transmissions'):
+                                    sender.successful_transmissions += 1
                             
                             # Log collision details
                             if collision_occurred:
-                                logger.debug(f"Packet from Vehicle {sender.id} to Vehicle {receiver.id} " +
-                                           f"lost due to resource collision")
+                                logger.debug(f"Packet from {type(sender).__name__} {sender.id} to " +
+                                           f"{type(receiver).__name__} {receiver.id} lost due to resource collision")
     
     def _record_statistics(self):
         """Record statistics at the current time"""
         time_bin = self.current_time // 1000  # Group by seconds
         self.collision_stats[time_bin] = self.collision_count
         self.transmission_stats[time_bin] = self.transmission_count
+        self.attack_stats[time_bin] = self.total_attack_success
         
         # Calculate PRR (Packet Reception Ratio)
         if self.total_expected_packets > 0:
@@ -381,6 +628,16 @@ class Simulation:
         logger.info(f"Total collisions: {self.collision_count}")
         logger.info(f"Total expected packets: {self.total_expected_packets}")
         logger.info(f"Total received packets: {self.total_received_packets}")
+        
+        # Attack statistics
+        logger.info(f"\n=========== ATTACK STATISTICS ===========")
+        logger.info(f"Total attack transmissions: {self.attack_transmission_count}")
+        logger.info(f"Total attack successes: {self.total_attack_success}")
+        
+        for attacker in self.attackers:
+            attack_success_rate = attacker.attack_success_count / attacker.attack_packets_sent if attacker.attack_packets_sent > 0 else 0
+            logger.info(f"Attacker {attacker.id}: Sent={attacker.attack_packets_sent}, " +
+                      f"Successes={attacker.attack_success_count}, Success Rate={attack_success_rate:.3f}")
 
         if self.total_expected_packets > 0:
             prr = self.total_received_packets / self.total_expected_packets
@@ -400,10 +657,10 @@ class Simulation:
     
     def _plot_results(self):
         """Generate plots of simulation results"""
-        plt.figure(figsize=(15, 10))
+        plt.figure(figsize=(15, 12))
         
         # Plot 1: Transmissions and Collisions over Time
-        plt.subplot(2, 2, 1)
+        plt.subplot(2, 3, 1)
         times = list(self.transmission_stats.keys())
         transmissions = list(self.transmission_stats.values())
         collisions = list(self.collision_stats.values())
@@ -417,7 +674,7 @@ class Simulation:
         plt.grid(True, alpha=0.3)
         
         # Plot 2: Packet Reception Ratio over Time
-        plt.subplot(2, 2, 2)
+        plt.subplot(2, 3, 2)
         prr_times = list(self.prr_stats.keys())
         prr_values = list(self.prr_stats.values())
         
@@ -428,8 +685,19 @@ class Simulation:
         plt.ylim([0, 1])
         plt.grid(True, alpha=0.3)
         
-        # Plot 3: Collision Rate over Time
-        plt.subplot(2, 2, 3)
+        # Plot 3: Attack Success over Time
+        plt.subplot(2, 3, 3)
+        attack_times = list(self.attack_stats.keys())
+        attack_successes = list(self.attack_stats.values())
+        
+        plt.plot(attack_times, attack_successes, 'purple', linewidth=2)
+        plt.xlabel('Time (s)')
+        plt.ylabel('Cumulative Attack Successes')
+        plt.title('Attack Success over Time')
+        plt.grid(True, alpha=0.3)
+        
+        # Plot 4: Collision Rate over Time
+        plt.subplot(2, 3, 4)
         collision_rates = []
         for i, t in enumerate(times):
             if transmissions[i] > 0:
@@ -445,8 +713,8 @@ class Simulation:
         plt.ylim([0, 1])
         plt.grid(True, alpha=0.3)
         
-        # Plot 4: Per-Vehicle Statistics
-        plt.subplot(2, 2, 4)
+        # Plot 5: Per-Vehicle Collision Rates
+        plt.subplot(2, 3, 5)
         vehicle_ids = [v.id for v in self.vehicles]
         vehicle_collision_rates = []
         
@@ -463,15 +731,33 @@ class Simulation:
         plt.title('Per-Vehicle Collision Rates')
         plt.grid(True, alpha=0.3)
         
+        # Plot 6: Attacker Statistics
+        plt.subplot(2, 3, 6)
+        attacker_ids = [a.id for a in self.attackers]
+        attacker_success_rates = []
+        
+        for attacker in self.attackers:
+            if attacker.attack_packets_sent > 0:
+                rate = attacker.attack_success_count / attacker.attack_packets_sent
+            else:
+                rate = 0
+            attacker_success_rates.append(rate)
+        
+        plt.bar(attacker_ids, attacker_success_rates, alpha=0.7, color='purple')
+        plt.xlabel('Attacker ID')
+        plt.ylabel('Attack Success Rate')
+        plt.title('Per-Attacker Success Rates')
+        plt.grid(True, alpha=0.3)
+        
         plt.tight_layout()
-        plt.savefig('v2x_simplified_results.png', dpi=300, bbox_inches='tight')
-        logger.info("Results plotted and saved to 'v2x_simplified_results.png'")
+        plt.savefig('v2x_simplified_with_attacker_results.png', dpi=300, bbox_inches='tight')
+        logger.info("Results plotted and saved to 'v2x_simplified_with_attacker_results.png'")
 
 if __name__ == "__main__":
     # Set random seed for reproducibility
     random.seed(42)
     np.random.seed(42)
     
-    # Create and run the simplified simulation
-    sim = Simulation(num_vehicles=20, duration=50000)
+    # Create and run the simplified simulation with attackers
+    sim = Simulation(num_vehicles=20, num_attackers=2, duration=50000)
     sim.run()
