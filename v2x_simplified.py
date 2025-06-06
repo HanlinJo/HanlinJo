@@ -341,21 +341,8 @@ class Attacker:
     
     def should_receive_packet(self, sender_position):
         """Determine if this attacker should receive a packet from sender"""
-        distance = np.linalg.norm(self.position - sender_position)
-        return distance <= self.sim.communication_range
-    
-    def receive_packet(self, packet, resource, collision_occurred):
-        """Process a received packet (for sensing purposes)"""
-        # Store sensing information
-        subframe_info = resource.subframe
-        rb_start = resource.rb_start
-        rb_len = resource.rb_len
-        
-        # Add to sensing window
-        sensing_data = SensingData(subframe_info, rb_start, rb_len, packet.sender_id)
-        self.sensing_data.append(sensing_data)
-        
-        return not collision_occurred
+        # Attackers do not receive packets - they only send
+        return False
 
 class ResourcePool:
     """Manages the sidelink resource pool for V2X communication"""
@@ -520,7 +507,7 @@ class Simulation:
             self._handle_transmissions(all_transmissions)
     
     def _handle_transmissions(self, transmissions):
-        """Simplified collision detection based purely on resource conflicts"""
+        """Simplified collision detection with special counting for attacker collisions"""
         # Group transmissions by subframe
         tx_by_subframe = defaultdict(list)
         
@@ -559,16 +546,18 @@ class Simulation:
                             attack_caused_collisions.add(sender.id)
                         collided_transmissions.add(sender.id)
                     
-                    # If attacker caused collision, record attack success
+                    # Count collisions based on whether attacker is involved
                     if attacker_involved:
+                        # If attacker is involved, count collision only once
+                        self.collision_count += 1
+                        # Record attack success for the attacker
                         for sender, packet, resource in users:
                             if isinstance(sender, Attacker):
                                 sender.record_attack_success(True)
                                 self.total_attack_success += 1
-            
-            # Update collision statistics
-            collision_count_this_subframe = len(collided_transmissions)
-            self.collision_count += collision_count_this_subframe
+                    else:
+                        # If only vehicles are involved, count collision twice
+                        self.collision_count += 2
             
             # Update per-vehicle collision counts
             for sender_id in collided_transmissions:
@@ -582,10 +571,8 @@ class Simulation:
                         attacker.collisions_caused += 1
                         break
             
-            # Process packet reception for all vehicles and attackers
-            all_receivers = self.vehicles + self.attackers
-            
-            for receiver in all_receivers:
+            # Process packet reception for vehicles only (attackers don't receive)
+            for receiver in self.vehicles:
                 for sender, packet, resource in sf_transmissions:
                     if sender.id != receiver.id:  # Don't receive own packet
                         # Check if receiver is within communication range
@@ -606,7 +593,7 @@ class Simulation:
                             # Log collision details
                             if collision_occurred:
                                 logger.debug(f"Packet from {type(sender).__name__} {sender.id} to " +
-                                           f"{type(receiver).__name__} {receiver.id} lost due to resource collision")
+                                           f"Vehicle {receiver.id} lost due to resource collision")
     
     def _record_statistics(self):
         """Record statistics at the current time"""
