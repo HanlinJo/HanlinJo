@@ -694,13 +694,23 @@ class Simulation:
             
             # Update collision statistics
             if collided_transmissions:
-                self.collision_count += len(collided_transmissions)
+                # Count the number of collisions (each collided transmission is one collision)
+                num_collisions = len(collided_transmissions)
+                self.collision_count += num_collisions
                 
-                # Update attacker success
-                for sender, packet, resource in sf_transmissions:
-                    if isinstance(sender, Attacker) and sender.id in collided_transmissions:
-                        sender.record_attack_success(True)
-                        self.total_attack_success += 1
+                # Update individual vehicle collision counts
+                for sender_id in collided_transmissions:
+                    # Find the vehicle and increment its collision count
+                    for vehicle in self.vehicles:
+                        if vehicle.id == sender_id:
+                            vehicle.collisions += 1
+                            break
+                    # Check attackers too
+                    for attacker in self.attackers:
+                        if attacker.id == sender_id:
+                            attacker.record_attack_success(True)
+                            self.total_attack_success += 1
+                            break
             
             # Process packet reception
             for receiver in self.vehicles:
