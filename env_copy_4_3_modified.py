@@ -520,33 +520,61 @@ class RLAttacker:
     
     def select_attack_resources(self, current_time, action):
         """基于RL动作选择两个攻击资源"""
-        # 解析动作：选择100个时隙中的一个，然后选择5个子信道中的2个
-        slot_offset = action % 100  # 选择时隙偏移
-        subchannel_pair = action // 100  # 选择子信道对
+        # 解析动作：选择100个时隙中的两个，5个子信道中的2个
+        # 动作空间设计：
+        # - 时隙对选择：C(100,2) = 4950种组合
+        # - 子信道对选择：C(5,2) = 10种组合
+        # - 总动作空间：4950 * 10 = 49500
         
-        # 计算目标时隙
-        current_slot = current_time % self.num_slots
-        target_slot = (current_slot + slot_offset) % self.num_slots
+        # 解析子信道对（0-9）
+        subchannel_pair_idx = action % 10
+        slot_pair_idx = action // 10
         
-        # 选择两个子信道（可以是相邻的或分离的）
+        # 所有可能的子信道对组合
         subchannel_pairs = [
-            (0, 1), (1, 2), (2, 3), (3, 4),  # 相邻对
-            (0, 2), (0, 3), (0, 4),          # 分离对
-            (1, 3), (1, 4), (2, 4)           # 分离对
+            (0, 1), (0, 2), (0, 3), (0, 4),  # 以0开头的对
+            (1, 2), (1, 3), (1, 4),          # 以1开头的对
+            (2, 3), (2, 4),                  # 以2开头的对
+            (3, 4)                           # 最后一对
         ]
         
-        if subchannel_pair < len(subchannel_pairs):
-            sc1, sc2 = subchannel_pairs[subchannel_pair]
-        else:
-            # 随机选择两个不同的子信道
-            sc1 = random.randint(0, self.num_subchannels - 1)
-            sc2 = random.randint(0, self.num_subchannels - 1)
-            while sc2 == sc1:
-                sc2 = random.randint(0, self.num_subchannels - 1)
+        # 获取选定的子信道对
+        sc1, sc2 = subchannel_pairs[subchannel_pair_idx]
         
-        # 创建两个攻击资源
-        resource1 = ResourceInfo(target_slot, sc1)
-        resource2 = ResourceInfo(target_slot, sc2)
+        # 计算时隙对：将slot_pair_idx映射到两个不同的时隙
+        # 使用组合数学方法确定性地选择两个时隙
+        def get_slot_pair_from_index(idx, total_slots):
+            """从索引确定性地获取时隙对"""
+            # 限制在前20个时隙以减少动作空间
+            effective_slots = min(total_slots, 20)
+            # 使用组合数学公式：给定索引，找到对应的(i,j)对，其中i<j
+            count = 0
+            for i in range(effective_slots):
+                for j in range(i + 1, effective_slots):
+                    if count == idx:
+                        return i, j
+                    count += 1
+            # 如果索引超出范围，使用模运算回绕  
+            max_combinations = effective_slots * (effective_slots - 1) // 2
+            idx = idx % max_combinations
+            count = 0
+            for i in range(effective_slots):
+                for j in range(i + 1, effective_slots):
+                    if count == idx:
+                        return i, j
+                    count += 1
+            return 0, 1  # 默认返回
+        
+        # 获取时隙偏移对
+        
+        # 计算实际目标时隙
+        current_slot = current_time % self.num_slots
+        target_slot1 = (current_slot + slot_offset1) % self.num_slots
+        target_slot2 = (current_slot + slot_offset2) % self.num_slots
+        
+        # 创建两个攻击资源（不同时隙，不同子信道）
+        resource1 = ResourceInfo(target_slot1, sc1)
+        resource2 = ResourceInfo(target_slot2, sc2)
         
         return [resource1, resource2]
     
@@ -904,7 +932,12 @@ class V2XRLEnvironment(gym.Env):
         
         # 修改动作空间：选择100个时隙中的一个，以及10种子信道对组合
         # 总共1000种可能的动作组合
-        self.action_space = spaces.Discrete(1000)
+        # 动作空间：C(100,2) * C(5,2) = 4950 * 10 = 49500
+        # 为了简化，我们使用一个较小的动作空间
+        # 时隙选择：前20个时隙的组合 C(20,2) = 190
+        # 子信道对：C(5,2) = 10
+        # 总计：190 * 10 = 1900
+        self.action_space = spaces.Discrete(1900)
         
         # 初始化模拟组件
         self.vehicles = []
