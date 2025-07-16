@@ -1,13 +1,5 @@
 def _handle_transmissions_with_enhanced_sinr(self, transmissions):
-    """处理传输并使用SINR进行碰撞检测"""
-    # 如果还没有初始化消息状态跟踪器，则创建一个
-    if not hasattr(self, 'receiver_message_status'):
-        self.receiver_message_status = defaultdict(lambda: {
-            'success': False,
-            'resources_used': 0,
-            'failed_resources': set()
-        })
-    
+    """处理传输并使用SINR进行碰撞检测 - 消息端逻辑"""
     # 按时隙分组
     tx_by_slot = defaultdict(list)
     for sender, packet, resource in transmissions:
@@ -87,28 +79,42 @@ def _handle_transmissions_with_enhanced_sinr(self, transmissions):
                                 # 如果SINR高于阈值，标记为成功接收
                                 success = sinr >= self.sinr_threshold
                                 
-                                # 关键修复：正确处理攻击者造成的干扰
-                                if has_attacker and not isinstance(sender, (RLAttacker, FixAttacker)):
-                                    # 如果有攻击者在同一子信道，且当前发送者是正常车辆
-                                    # 检查是否因为攻击者干扰导致接收失败
-                                    if not success:
-                                        # 攻击成功：攻击者成功干扰了正常车辆的通信
+                                # 创建消息键
+                                msg_key = (sender.id, packet.packet_id, receiver.id)
+                                
+                                # 初始化消息状态（如果不存在）
+                                if msg_key not in self.message_status_dict:
+                                    self.message_status_dict[msg_key] = {
+                                        'sender_id': sender.id,
+                                        'receiver_id': receiver.id,
+                                        'packet_id': packet.packet_id,
+                                        'received_count': 0,
+                                        'success': True,  # 初始成功，一次失败就为失败
+                                        'is_sender_attacker': isinstance(sender, (RLAttacker, FixAttacker))
+                                    }
+                                
+                                # 更新消息状态
+                                message_status = self.message_status_dict[msg_key]
+                                message_status['received_count'] += 1
+                                
+                                # 如果接收失败，标记整个消息失败
+                                if not success:
+                                    message_status['success'] = False
+                                    
+                                    # 关键修复：正确处理攻击者造成的干扰
+                                    if has_attacker and not isinstance(sender, (RLAttacker, FixAttacker)):
+                                        # 如果有攻击者在同一子信道，且当前发送者是正常车辆
+                                        # 检查是否因为攻击者干扰导致接收失败
+                                        collision_info['collisions_caused'] += 1
+                                        self.attack_transmission_count += 1
+                                        
+                                        # 记录攻击成功
                                         for attacker_sender, _, _ in attackers_in_subchannel:
                                             if isinstance(attacker_sender, RLAttacker):
                                                 attacker_sender.record_attack_success(True)
                                             elif isinstance(attacker_sender, FixAttacker):
                                                 attacker_sender.attack_success_count += 1
-                                        
-                                        collision_info['collisions_caused'] += 1
-                                        self.attack_transmission_count += 1
-                                
-                                if success:
-                                    msg_key = (sender.id, packet.packet_id, receiver.id)
-                                    self.receiver_message_status[msg_key]['success'] = True
-                                else:
-                                    # 记录失败原因
-                                    msg_key = (sender.id, packet.packet_id, receiver.id)
-                                    self.receiver_message_status[msg_key]['failed_resources'].add(receiver.id)
+                                                attacker_sender.collisions_caused += 1
 
                                 # 让接收者处理数据包
                                 if isinstance(receiver, Vehicle):
@@ -147,41 +153,41 @@ def _handle_transmissions_with_enhanced_sinr(self, transmissions):
             else:
                 # 不使用SINR时的传统碰撞检测
                 for sender, packet, resource in normal_users:
-                    # 为每个预期的接收者初始化状态
-                    expected_receiver_ids = []
+                    # 为每个预期的接收者创建消息
                     for vehicle in self.vehicles:
                         if vehicle.id != sender.id and vehicle.should_receive_packet(sender.position):
-                            expected_receiver_ids.append(vehicle.id)
-
-                    for receiver_id in expected_receiver_ids:
-                        msg_key = (sender.id, packet.packet_id, receiver_id)
-                        if msg_key not in self.receiver_message_status:
-                            self.receiver_message_status[msg_key] = {
-                                'success': False,
-                                'resources_used': 0,
-                                'failed_resources': set()
-                            }
-                        
-                        # 更新使用的资源计数
-                        self.receiver_message_status[msg_key]['resources_used'] += 1
-
-                        # 传统碰撞检测
-                        if has_attacker or collision_occurred:
-                            self.receiver_message_status[msg_key]['failed_resources'].add(receiver_id)
+                            msg_key = (sender.id, packet.packet_id, vehicle.id)
                             
-                            # 如果是攻击者造成的碰撞，记录攻击成功
-                            if has_attacker:
-                                for attacker_sender, _, _ in attackers_in_subchannel:
-                                    if isinstance(attacker_sender, RLAttacker):
-                                        attacker_sender.record_attack_success(True)
-                                    elif isinstance(attacker_sender, FixAttacker):
-                                        attacker_sender.attack_success_count += 1
+                            # 初始化消息状态（如果不存在）
+                            if msg_key not in self.message_status_dict:
+                                self.message_status_dict[msg_key] = {
+                                    'sender_id': sender.id,
+                                    'receiver_id': vehicle.id,
+                                    'packet_id': packet.packet_id,
+                                    'received_count': 0,
+                                    'success': True,
+                                    'is_sender_attacker': isinstance(sender, (RLAttacker, FixAttacker))
+                                }
+                            
+                            # 更新消息状态
+                            message_status = self.message_status_dict[msg_key]
+                            message_status['received_count'] += 1
+
+                            # 传统碰撞检测
+                            if has_attacker or collision_occurred:
+                                message_status['success'] = False
                                 
-                                collision_info['collisions_caused'] += 1
-                                self.attack_transmission_count += 1
-                        else:
-                            # 成功接收
-                            self.receiver_message_status[msg_key]['success'] = True
+                                # 如果是攻击者造成的碰撞，记录攻击成功
+                                if has_attacker:
+                                    for attacker_sender, _, _ in attackers_in_subchannel:
+                                        if isinstance(attacker_sender, RLAttacker):
+                                            attacker_sender.record_attack_success(True)
+                                        elif isinstance(attacker_sender, FixAttacker):
+                                            attacker_sender.attack_success_count += 1
+                                            attacker_sender.collisions_caused += 1
+                                    
+                                    collision_info['collisions_caused'] += 1
+                                    self.attack_transmission_count += 1
 
             # 更新资源块级失效原因统计
             if not self.use_sinr:
@@ -192,38 +198,38 @@ def _handle_transmissions_with_enhanced_sinr(self, transmissions):
         
         self.sinr_records.extend(slot_sinr_records)
 
+    return collision_info
 
-
-
+def _finalize_messages_at_step_end(self):
+    """在step结束时处理完成的消息"""
+    finished_messages = []
     
-    # 在所有时隙处理完后，检查完成的消息
-    finished_messages = set()
-    for msg_key, status in self.receiver_message_status.items():
+    for msg_key, message_status in self.message_status_dict.items():
         sender_id, packet_id, receiver_id = msg_key
-        if status['resources_used'] == 2:  # 两个资源块都传输完毕
-            # 如果任何资源块失败，整个消息失败
-            if status['failed_resources']:
-                status['success'] = False
-                
+        
+        # 检查消息是否完成（两个资源块都接收完毕）
+        if message_status['received_count'] == 2:
             # 更新接收者状态
             receiver = next((v for v in self.vehicles if v.id == receiver_id), None)
             if receiver:
-                receiver.record_reception(status['success'])
+                receiver.record_reception(message_status['success'])
 
-            # 更新发送者状态
-            sender = next((v for v in self.vehicles if v.id == sender_id), None)
+            # 更新发送者状态（仅正常车辆）
+            if not message_status['is_sender_attacker']:
+                sender = next((v for v in self.vehicles if v.id == sender_id), None)
+                if sender and not message_status['success']:
+                    sender.collisions += 1
+
             # 更新全局统计
             self.total_expected_packets += 1
-            if status['success']:
+            if message_status['success']:
                 self.total_received_packets += 1
             else:
                 self.message_failures += 1
                 self.collision_count += 1
-            if sender and not isinstance(sender, (RLAttacker, FixAttacker)):
-            finished_messages.add(msg_key)
-                if not status['success']:
+
+            finished_messages.append(msg_key)
+    
     # 移除已完成的消息
     for msg_key in finished_messages:
-        del self.receiver_message_status[msg_key]
-                    sender.collisions += 1
-    return collision_info
+        del self.message_status_dict[msg_key]
